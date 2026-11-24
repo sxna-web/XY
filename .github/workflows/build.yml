@@ -1,54 +1,212 @@
-name: Build StarJump APK
+name: Android APK Build
 
 on:
   workflow_dispatch:
+    inputs:
+      source_zip:
+        description: "源码 ZIP 文件名；留空时自动选择版本号最高的 source ZIP"
+        required: false
+        type: string
+        default: ""
+      gradle_task:
+        description: "Gradle 任务；留空或 auto 时自动识别"
+        required: false
+        type: string
+        default: "auto"
   push:
-    branches: [ main ]
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    name: Build Android APK
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 120
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up JDK 17
+      - name: Setup Java 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "21"
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Normalize project root
-        run: |
-          if [ -f starjump_work/gradlew ]; then
-            shopt -s dotglob
-            mv starjump_work/* .
-            rmdir starjump_work
-          fi
-          ls -la
-
-      - name: Gradle cache
-        uses: actions/cache@v4
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          go-version: "1.25.5"
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+        with:
+          accept-android-sdk-licenses: true
+          log-accepted-android-sdk-licenses: false
 
-      - name: Build debug APK
-        run: ./gradlew :app:assembleDebug --no-daemon --stacktrace --warning-mode all
+      - name: Locate or extract Android project
+        env:
+          REQUESTED_SOURCE_ZIP: ${{ inputs.source_zip }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f ./gradlew ]; then
+            SOURCE_DIR="$GITHUB_WORKSPACE"
+            echo "Using Gradle project at repository root"
+          else
+            ZIP_PATH="$REQUESTED_SOURCE_ZIP"
+            if [ -n "$ZIP_PATH" ]; then
+              test -f "$ZIP_PATH" || { echo "ZIP not found: $ZIP_PATH"; exit 1; }
+            else
+              ZIP_PATH="$(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          candidates = [p for p in Path(".").glob("*.zip") if "source" in p.name.lower()]
+          def version_key(p):
+              nums = re.findall(r"\d+", p.name)
+              return tuple(int(x) for x in nums) if nums else (0,)
+          if not candidates:
+              raise SystemExit("No source ZIP found in repository root")
+          candidates.sort(key=lambda p: (version_key(p), p.stat().st_mtime), reverse=True)
+          print(candidates[0].as_posix())
+          PY
+          )"
+            fi
+            echo "Selected source: $ZIP_PATH"
+            mkdir -p "$GITHUB_WORKSPACE/source"
+            unzip -q "$ZIP_PATH" -d "$GITHUB_WORKSPACE/source"
+            GRADLEW_PATH="$(find "$GITHUB_WORKSPACE/source" -type f -name gradlew -print -quit)"
+            if [ -z "$GRADLEW_PATH" ]; then
+              echo "gradlew not found in ZIP; archive contents:"
+              find "$GITHUB_WORKSPACE/source" -maxdepth 5 -type f | head -100
+              exit 1
+            fi
+            SOURCE_DIR="$(dirname "$GRADLEW_PATH")"
+          fi
+          if [ ! -f "$SOURCE_DIR/settings.gradle" ] && [ ! -f "$SOURCE_DIR/settings.gradle.kts" ]; then
+            echo "Gradle settings file not found in $SOURCE_DIR"
+            exit 1
+          fi
+          echo "SOURCE_DIR=$SOURCE_DIR" >> "$GITHUB_ENV"
+          echo "Project directory: $SOURCE_DIR"
 
-      - name: Upload APK
-        if: always()
+      - name: Detect and install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$SOURCE_DIR"
+          read -r ANDROID_PLATFORM NDK_VERSION < <(python3 - <<'PY'
+          from pathlib import Path
+          import re
+          files = []
+          for pattern in ("*.gradle", "*.gradle.kts", "**/*.gradle", "**/*.gradle.kts", "gradle/libs.versions.toml"):
+              files.extend(Path(".").glob(pattern))
+          text = "\n".join(p.read_text(errors="ignore") for p in dict.fromkeys(files) if p.is_file())
+          platform, ndk = "35", "27.0.12077973"
+          found = re.findall(r'compileSdk(?:Version)?\s*(?:=\s*)?["\']?(\d+)', text)
+          if found:
+              platform = found[-1]
+          found = re.findall(r'ndkVersion\s*(?:=\s*)?["\']([^"\']+)["\']', text)
+          if found:
+              ndk = found[-1]
+          print(platform, ndk)
+          PY
+          )
+          echo "Android platform: $ANDROID_PLATFORM; NDK: $NDK_VERSION"
+          sdkmanager "platforms;android-${ANDROID_PLATFORM}" "build-tools;35.0.1" "ndk;${NDK_VERSION}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Prepare project
+        working-directory: ${{ env.SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          [ ! -f run ] || chmod +x run
+          find . -type f -name '*.sh' -exec chmod +x {} \;
+          printf 'sdk.dir=%s\n' "$ANDROID_HOME" > local.properties
+          if [ -n "${ANDROID_NDK_HOME:-}" ]; then
+            printf 'ndk.dir=%s\n' "$ANDROID_NDK_HOME" >> local.properties
+          fi
+
+      - name: Build NekoBox native core when available
+        working-directory: ${{ env.SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f run ] && [ -d libcore ]; then
+            ./run lib core
+            ./run init action gradle
+          else
+            echo "NekoBox native preparation not required; skipping"
+          fi
+
+      - name: Detect Gradle APK task
+        env:
+          REQUESTED_GRADLE_TASK: ${{ inputs.gradle_task }}
+        working-directory: ${{ env.SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_GRADLE_TASK" ] && [ "$REQUESTED_GRADLE_TASK" != "auto" ]; then
+            TASK="$REQUESTED_GRADLE_TASK"
+          else
+            ./gradlew --no-daemon tasks --all > "$RUNNER_TEMP/gradle-tasks.txt"
+            if grep -Eq '(^|[[:space:]:])assembleOssDebug([[:space:]]|$)' "$RUNNER_TEMP/gradle-tasks.txt"; then
+              TASK="app:assembleOssDebug"
+            elif grep -Eq '(^|[[:space:]:])assembleDebug([[:space:]]|$)' "$RUNNER_TEMP/gradle-tasks.txt"; then
+              TASK="app:assembleDebug"
+            elif grep -Eq '(^|[[:space:]:])assembleRelease([[:space:]]|$)' "$RUNNER_TEMP/gradle-tasks.txt"; then
+              TASK="app:assembleRelease"
+            else
+              echo "No APK task detected. Set gradle_task in Run workflow."
+              grep -E 'assemble.*(Debug|Release)' "$RUNNER_TEMP/gradle-tasks.txt" | head -80 || true
+              exit 1
+            fi
+          fi
+          echo "Selected Gradle task: $TASK"
+          echo "GRADLE_TASK=$TASK" >> "$GITHUB_ENV"
+
+      - name: Build APK
+        working-directory: ${{ env.SOURCE_DIR }}
+        env:
+          BUILD_PLUGIN: none
+        run: ./gradlew --no-daemon --stacktrace "$GRADLE_TASK"
+
+      - name: Collect APK files
+        if: success()
+        working-directory: ${{ env.SOURCE_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/apk-output"
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, shutil
+          root = Path(".")
+          output = Path(os.environ["GITHUB_WORKSPACE"]) / "apk-output"
+          apks = sorted(root.glob("**/build/outputs/apk/**/*.apk"))
+          if not apks:
+              raise SystemExit("Build finished but no APK was found")
+          for index, apk in enumerate(apks, 1):
+              target = output / ("__".join(apk.relative_to(root).parts))
+              shutil.copy2(apk, target)
+              print(f"APK {index}: {target} ({target.stat().st_size} bytes)")
+          PY
+
+      - name: Upload APK artifacts
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: starjump-debug-apk
-          path: app/build/outputs/apk/**/*.apk
-          if-no-files-found: warn
+          name: Android-APK-${{ github.run_number }}
+          path: apk-output/*.apk
+          if-no-files-found: error
+          retention-days: 14
